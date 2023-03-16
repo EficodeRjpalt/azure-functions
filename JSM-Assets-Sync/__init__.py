@@ -1,6 +1,5 @@
 import logging
 from pprint import pprint
-import asyncio
 from os import getenv
 import requests
 import dotenv
@@ -25,7 +24,7 @@ def get_all_org_object_keys() -> list:
     return [str(ass_object['id']) for ass_object in object_entries]
 
 
-def get_all_objects(object_ids: list) -> None:
+def get_all_objects(object_ids: list, required_attributes: list) -> list:
 
     query_string = ','.join(object_ids)
 
@@ -41,39 +40,175 @@ def get_all_objects(object_ids: list) -> None:
     )
 
     # Not quite robust patch here. Will the attribute type ID always be the same?
-    attribute_ids = get_attribute_ids(getenv('MEMBER_ATTR_NAME'), results.json())
-    attribute_id = -1
+    attribute_ids_dict = get_attribute_ids(required_attributes, results.json())
 
-    if len(attribute_ids) == 1:
-        attribute_id = list(attribute_ids.values())[0]
-    else:
-        logging.info('Multiple Customer fields present. Do something.')
-        
+    member_attr_id = attribute_ids_dict[getenv('MEMBER_ATTR_NAME')]
+
+    all_objects = []
 
     for entry in results.json()['objectEntries']:
         entry_attr_ids = [attribute['objectTypeAttributeId'] for attribute in entry['attributes']]
-        pprint(entry_attr_ids)
-        if attribute_id in entry_attr_ids:
-            assets_object = build_assets_object(entry)
+        if member_attr_id in entry_attr_ids:
+            all_objects.append(build_assets_object(entry, attribute_ids_dict))
+
+    return {k: v for d in all_objects for k, v in d.items()}
 
 
-def get_attribute_ids(attribute_name: str, response_body: dict) -> dict:
+def get_attribute_ids(required_attributes: list, response_body: dict) -> dict:
 
-    attribute_id_dict = {attribute_info['name']: attribute_info['id'] for attribute_info in response_body['objectTypeAttributes'] if attribute_info['name'] == attribute_name}
+    attribute_id_dict = {}
+
+    for attribute_info in response_body['objectTypeAttributes']:
+        if attribute_info['name'] in required_attributes:
+            attribute_id_dict[attribute_info['name']] = attribute_info['id']
 
     return attribute_id_dict
 
-def build_assets_object(object_entry: dict) -> dict:
+def build_assets_object(object_entry: dict, attribute_ids_dict: dict) -> dict:
+    
+    org_name = object_entry['name']
+    self_url = object_entry['_links']['self']
+    member_attribute = [
+        attribute for attribute in object_entry['attributes']
+        if attribute['objectTypeAttributeId'] == attribute_ids_dict[getenv('MEMBER_ATTR_NAME')]
+    ][0]
 
-    org_name = entry[]
+    users = [
+        {
+            'id': user_dict['user']['key'],
+            'email': user_dict['user']['emailAddress']
+        }
+        for user_dict
+        in member_attribute['objectAttributeValues']
+    ]
+
+    return {
+        org_name: {
+            "Name": org_name,
+            "self": self_url,
+            "members": users
+        }
+    }
+
+def get_jsm_organizations() -> dict:
+
+    servicedesk_id = getenv('SERVICEDESK_ID')
+    org_endpoint = getenv('JSM_BASE_URL') + f"rest/servicedeskapi/servicedesk/{servicedesk_id}/organization"
+
+    results = requests.get(
+        org_endpoint,
+        auth=(
+            getenv('EMAIL'),
+            getenv('API_TOKEN')
+        ),
+        timeout=30
+    )
+
+    # Tässä pitäisi tarkastaa, että onko paginaation tarvetta.
+
+    orgs = [
+        {
+            'name': org['name'],
+            'id': org['id']
+        }
+        for org in results.json()['values']
+    ]
+
+    return orgs
+
+def get_servicedesk_org_customers(sd_org_dict_list: list) -> dict:
+
+    org_list_w_members = []
+
+    for org_entry in sd_org_dict_list:
+        org_id = org_entry['id']
+        org_endpoint = getenv('JSM_BASE_URL') + f"rest/servicedeskapi/organization/{org_id}/user"
+        results = requests.get(
+            org_endpoint,
+            auth=(
+                getenv('EMAIL'),
+                getenv('API_TOKEN')
+            ),
+            timeout=30
+        )
+
+        org_list_w_members.append(
+            get_sd_org_object(results.json(), org_entry)
+        )
+
+    return {k: v for d in org_list_w_members for k, v in d.items()}
+
+
+def get_sd_org_object(result_body: dict, org_entry: dict) -> list:
+
+    org_name = org_entry['name']
+    org_id = org_entry['id']
+
+    org_members = [
+        {
+            'id': user_entry['accountId'],
+            'email': user_entry['emailAddress']
+        }
+        for user_entry in result_body['values']
+        ]
+
+    org_object = {
+        org_name : {
+            'name': org_name,
+            'id': org_id,
+            'members': org_members
+        }
+    }
+
+    return org_object
+
+def compare_assets_sd_orgs(asset_objects: list, sd_objects: list) -> None:
+
+    orgs_in_assets_and_sd = []
+
+    for sd_org_name in sd_objects.keys():
+        if sd_org_name in asset_objects.keys():
+            orgs_in_assets_and_sd.append(sd_org_name)
+        else:
+            logging.info('%s not found in Assets!', sd_org_name)
+
+    for org_name in orgs_in_assets_and_sd:
+        compare_member_lists(asset_objects[org_name]['members'], sd_objects[org_name]['members'])
+        ## Here: need to build update dispatch information to update objects
+
+
+def compare_member_lists(asset_member_list: list, sd_member_list: list):
+
+    asset_member_ids = [member['id'] for member in asset_member_list]
+    missing_members_list = []
+
+    for sd_member in sd_member_list:
+        if sd_member['id'] in asset_member_ids:
+            logging.info('%s found in asset member list', sd_member['email'])
+        else:
+            logging.info('%s not found in asset member list', sd_member['email'])
+            missing_members_list.append(sd_member)
+
+    return missing_members_list
+
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
 
     dotenv.load_dotenv()
     logging.info('Python HTTP trigger function processed a request.')
+
+    required_attributes = [
+        getenv('MEMBER_ATTR_NAME'),
+        getenv('NAME_ATTR')
+    ]
     
     object_keys = get_all_org_object_keys()
-    get_all_objects(object_keys)
+    asset_objects = get_all_objects(object_keys, required_attributes)
+
+    servicedesk_orgs = get_jsm_organizations()
+    sd_org_objects = get_servicedesk_org_customers(servicedesk_orgs)
+
+    compare_assets_sd_orgs(asset_objects, sd_org_objects)    
 
     name = req.params.get('name')
     if not name:
@@ -92,10 +227,16 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
              status_code=200
         )
 
-# Korjattavaa: alkuvaiheessa on kerättävä tieto siitä, millä ID:llä löytyy objektin nimi  ja Customer-attribuutti
-# näistä täytyy muodostaa oma dictionarynsa, jota käytetään myöhemmässä vaiheessa.
+# 7. Vertaile näiden kahden välisiä tietoja
+#   7.1. Anna listat funktiolle, joka tarkastaa löytyykö portaalin organisaatiot Assetsin puolelta
+#   7.2. Jos organisaatiota ei ole Assetsissa -> Älä tee mitään
+#   7.3. Jos organisaatio on Assetsissa -> Käydään läpi käyttäjät
+# 8. Jos niiden välillä on eroavaisuuksia, päivitä objekti
+#   8.1. Funktio, joka luo tietueen, jonka pohjalta ammutaan päivityskäskyjä
+# 9. Muuta alun AQL-kysely niin, että objektin tyyppi annetaan .env -tiedostossa
 
-# 4. Kerää talteen käyttäjätiedot (id ja sähköposti) objektikohtaisesti: objektin nimi, self url ja käyttäjälista
-# 5. Hae vastaavat tiedot JSM:n Organisaatioista
-# 6. Vertaile näiden kahden välisiä tietoja
-# 7. Jos niiden välillä on eroavaisuuksia, päivitä objekti
+# Muuta: Paginaatio organisaatioille!
+# Muuta: Jonnekin täytyy kirjata mitkä skeemat liittyvät mihinkin portaaliin!
+# Huomio! Organisaatiot mäpätään VAIN nimen perusteella. Saattaa aiheuttaa ongelmia, sillä ei ole muuta keinoa mäpätä.
+
+# Left off at line 177
